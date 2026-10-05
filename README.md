@@ -68,3 +68,19 @@ Esta versión corrige la lógica de anulación de movimientos:
 - Si una versión anterior dejó reversas como `Registrado`, el sistema las cambia automáticamente a `Reversa` al iniciar.
 - No se permite editar/anular registros de reversa para evitar cadenas de reversas.
 - Para anular una entrada, se valida que la existencia disponible sea suficiente.
+
+
+## FIX4 - Bloques, filtros y adjuntos
+
+Cambios incluidos:
+
+- Catálogo de bloques cargado desde `Bloques master.xlsx`. El archivo contiene 79 bloques.
+- Al registrar movimientos de Kardex se debe seleccionar bloque.
+- Al registrar activos fijos se debe seleccionar bloque.
+- Las existencias ahora se agrupan por producto, bodega y bloque.
+- La pantalla de Existencias usa tabla con filtros por encabezado mediante `streamlit-aggrid`.
+- Si `streamlit-aggrid` no está disponible, muestra una tabla normal como respaldo.
+- Al registrar una entrada o movimiento se puede adjuntar PDF de factura/soporte.
+- Al registrar un activo fijo también se puede adjuntar PDF de factura/soporte.
+- Los adjuntos se guardan en la base de datos, compatible con PostgreSQL para producción.
+- El respaldo incluye bloques, adjuntos y metadata de adjuntos.
