@@ -1,0 +1,105 @@
+{
+  "tipos": {
+    "Acometida": {
+      "etiqueta_detalle": "Tipo de acometida",
+      "opciones_detalle": [
+        "Tipo A+B+D+E",
+        "Tipo C",
+        "Tipo G",
+        "Tipo H"
+      ],
+      "requiere_geografia": true
+    },
+    "Redes": {
+      "etiqueta_detalle": "Tipo de red",
+      "opciones_detalle": [
+        "Ferrocarril",
+        "Sans Pedro y lirios Norte",
+        "Calle Mariona",
+        "Col. Jardin",
+        "Troncal Norte",
+        "Nuevo Cayala"
+      ],
+      "requiere_geografia": false
+    },
+    "Tanque": {
+      "etiqueta_detalle": "Tipo de tanque",
+      "opciones_detalle": [
+        "Terminales",
+        "Corinto",
+        "E-28",
+        "Scandia",
+        "Cayala",
+        "San Jose Cortez",
+        "Snata Rita",
+        "Dolores"
+      ],
+      "requiere_geografia": false
+    },
+    "Cruce Aereo": {
+      "etiqueta_detalle": null,
+      "opciones_detalle": [],
+      "requiere_geografia": false
+    },
+    "Reparacion de Fuga": {
+      "etiqueta_detalle": null,
+      "opciones_detalle": [],
+      "requiere_geografia": true
+    },
+    "Sectorizacion": {
+      "etiqueta_detalle": null,
+      "opciones_detalle": [],
+      "requiere_geografia": true
+    }
+  },
+  "lotes": [
+    "1",
+    "2",
+    "3"
+  ],
+  "sectores": [
+    "1",
+    "2",
+    "3",
+    "4"
+  ],
+  "subsectores_por_sector": {
+    "1": [
+      "1.01",
+      "1.02",
+      "1.03",
+      "1.04",
+      "1.05",
+      "1.06",
+      "1.07",
+      "1.08",
+      "1.09",
+      "1.10",
+      "1.11",
+      "1.12",
+      "1.13",
+      "1.14",
+      "1.15"
+    ],
+    "2": [
+      "2.01",
+      "2.02",
+      "2.03",
+      "2.04",
+      "2.05",
+      "2.06"
+    ],
+    "3": [
+      "3.01",
+      "3.02",
+      "3.03",
+      "3.04"
+    ],
+    "4": [
+      "4.01",
+      "4.02"
+    ]
+  },
+  "origen": "Distribucion ALmacen.xlsx / Hoja2 / E4:F68",
+  "nota": "La hoja no define correspondencia entre lotes y sectores. Los subsectores sí se vinculan al número del sector. El 1.10 aparece como 1.1 en Excel por formato."
+}

@@ -7,6 +7,7 @@ import streamlit as st
 from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, Boolean, ForeignKey, Text, LargeBinary, inspect as sa_inspect, text as sa_text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.exc import IntegrityError
+from consumos import (CAMPOS, is_outbound, validate_classification, render_classification, describe_classification)
 
 APP_NAME='Control de Inventario y Activo Fijo'
 BASE_DIR=Path(__file__).resolve().parent
@@ -121,7 +122,7 @@ class Warehouse(Base):
 class Item(Base):
     __tablename__='items'; id=Column(Integer, primary_key=True); sku=Column(String(80), unique=True, nullable=False); description=Column(String(250), nullable=False); unit=Column(String(40), default='Unidad', nullable=False); minimum_stock=Column(Float, default=0); active=Column(Boolean, default=True); created_at=Column(DateTime, default=now); updated_at=Column(DateTime); created_by=Column(Integer, ForeignKey('users.id')); updated_by=Column(Integer, ForeignKey('users.id'))
 class StockMove(Base):
-    __tablename__='stock_moves'; id=Column(Integer, primary_key=True); move_date=Column(Date, nullable=False); item_id=Column(Integer, ForeignKey('items.id'), nullable=False); warehouse_id=Column(Integer, ForeignKey('warehouses.id'), nullable=False); block_id=Column(Integer, ForeignKey('blocks.id')); move_type=Column(String(40), nullable=False); quantity=Column(Float, nullable=False); unit_cost=Column(Float, default=0); document=Column(String(180)); notes=Column(Text); status=Column(String(40), default='Registrado'); reversal_of=Column(Integer, ForeignKey('stock_moves.id')); annulled_by=Column(Integer, ForeignKey('users.id')); annulled_at=Column(DateTime); annul_reason=Column(Text); created_at=Column(DateTime, default=now); updated_at=Column(DateTime); created_by=Column(Integer, ForeignKey('users.id')); updated_by=Column(Integer, ForeignKey('users.id')); item=relationship('Item'); warehouse=relationship('Warehouse'); block=relationship('Block')
+    __tablename__='stock_moves'; id=Column(Integer, primary_key=True); move_date=Column(Date, nullable=False); item_id=Column(Integer, ForeignKey('items.id'), nullable=False); warehouse_id=Column(Integer, ForeignKey('warehouses.id'), nullable=False); block_id=Column(Integer, ForeignKey('blocks.id')); consumption_type=Column(String(80)); consumption_detail=Column(String(140)); consumption_lot=Column(String(10)); consumption_sector=Column(String(10)); consumption_subsector=Column(String(12)); move_type=Column(String(40), nullable=False); quantity=Column(Float, nullable=False); unit_cost=Column(Float, default=0); document=Column(String(180)); notes=Column(Text); status=Column(String(40), default='Registrado'); reversal_of=Column(Integer, ForeignKey('stock_moves.id')); annulled_by=Column(Integer, ForeignKey('users.id')); annulled_at=Column(DateTime); annul_reason=Column(Text); created_at=Column(DateTime, default=now); updated_at=Column(DateTime); created_by=Column(Integer, ForeignKey('users.id')); updated_by=Column(Integer, ForeignKey('users.id')); item=relationship('Item'); warehouse=relationship('Warehouse'); block=relationship('Block')
 class DepRule(Base):
     __tablename__='depreciation_rules'; id=Column(Integer, primary_key=True); category=Column(String(120), unique=True, nullable=False); annual_rate=Column(Float, nullable=False); useful_life_years=Column(Float, nullable=False); active=Column(Boolean, default=True); created_at=Column(DateTime, default=now); updated_at=Column(DateTime); created_by=Column(Integer, ForeignKey('users.id')); updated_by=Column(Integer, ForeignKey('users.id'))
 class Asset(Base):
@@ -149,6 +150,10 @@ def ensure_schema():
             con.execute(sa_text('ALTER TABLE stock_moves ADD COLUMN block_id INTEGER'))
         if insp.has_table('assets') and 'block_id' not in cols('assets'):
             con.execute(sa_text('ALTER TABLE assets ADD COLUMN block_id INTEGER'))
+        # FIX5: columnas opcionales de clasificación de consumo, sin afectar registros históricos.
+        for field, sql_type in [('consumption_type','VARCHAR(80)'), ('consumption_detail','VARCHAR(140)'), ('consumption_lot','VARCHAR(10)'), ('consumption_sector','VARCHAR(10)'), ('consumption_subsector','VARCHAR(12)')]:
+            if field not in cols('stock_moves'):
+                con.execute(sa_text(f'ALTER TABLE stock_moves ADD COLUMN {field} {sql_type}'))
 
 def get_blocks(active_only=True):
     s=db()
@@ -256,7 +261,7 @@ def init_db():
         for num,code in BLOCKS_MASTER:
             b=s.query(Block).filter_by(code=code).first()
             if not b: s.add(Block(number=num,code=code,active=True))
-            else: b.number=num; b.active=True
+            else: b.number=num  # No reactivar bloques desactivados por el usuario
         s.commit()
         for cat,rate,life in [('Edificaciones',0.05,20),('Maquinaria',0.20,5),('Vehículos',0.25,4),('Otros bienes muebles',0.50,2)]:
             if not s.query(DepRule).filter_by(category=cat).first(): s.add(DepRule(category=cat, annual_rate=rate, useful_life_years=life)); s.commit()
@@ -365,7 +370,7 @@ def login_screen():
             st.session_state['permissions']=get_perms(user_data['user_id'])
             audit('users',user_data['user_id'],'LOGIN','Inicio de sesión')
             st.rerun()
-        st.info('Usuario inicial: admin / admin123')
+        st.caption('Acceso exclusivo para personal autorizado.')
 if not st.session_state.get('authenticated'): login_screen(); st.stop()
 if st.session_state.get('must_change_password'):
     st.warning('Debes cambiar la contraseña inicial.');
@@ -397,138 +402,267 @@ elif menu=='Productos':
     with tabs[0]:
         s=db(); rows=s.query(Item).order_by(Item.description).all(); s.close(); st.dataframe(pd.DataFrame([{'ID':r.id,'Código':r.sku,'Descripción':r.description,'Unidad':r.unit,'Stock mínimo':r.minimum_stock,'Activo':'Sí' if r.active else 'No'} for r in rows]),width='stretch')
     with tabs[1]:
-        require_perm('items.create')
-        with st.form('new_item',clear_on_submit=True):
-            c1,c2,c3,c4=st.columns(4); sku=c1.text_input('Código/SKU'); desc=c2.text_input('Descripción'); unit=c3.text_input('Unidad','Unidad'); minimo=c4.number_input('Stock mínimo',min_value=0.0,value=0.0)
-            if st.form_submit_button('Crear'):
-                s=db(); it=Item(sku=sku.strip(),description=desc.strip(),unit=unit.strip() or 'Unidad',minimum_stock=minimo,created_by=st.session_state['user_id']); s.add(it)
-                try: s.commit(); audit('items',it.id,'CREATE',it.sku); st.success('Producto creado.')
-                except IntegrityError: s.rollback(); st.error('Código duplicado.')
-                finally: s.close()
-    with tabs[2]:
-        require_perm('items.edit'); s=db(); items=s.query(Item).order_by(Item.description).all(); s.close()
-        if items:
-            sel=st.selectbox('Producto',[f'{i.id} | {i.sku} - {i.description}' for i in items]); iid=int(sel.split(' | ')[0]); s=db(); it=s.get(Item,iid)
-            with st.form('edit_item'):
-                c1,c2,c3,c4=st.columns(4); sku=c1.text_input('Código',it.sku); desc=c2.text_input('Descripción',it.description); unit=c3.text_input('Unidad',it.unit); minimo=c4.number_input('Stock mínimo',min_value=0.0,value=float(it.minimum_stock)); active=st.checkbox('Activo',it.active)
-                if st.form_submit_button('Guardar'):
-                    it.sku=sku.strip(); it.description=desc.strip(); it.unit=unit.strip() or 'Unidad'; it.minimum_stock=minimo; it.active=active; it.updated_at=now(); it.updated_by=st.session_state['user_id']
-                    try: s.commit(); audit('items',iid,'UPDATE',sku); st.success('Actualizado.')
+        if not has_perm('items.create'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+
+            with st.form('new_item',clear_on_submit=True):
+                c1,c2,c3,c4=st.columns(4); sku=c1.text_input('Código/SKU'); desc=c2.text_input('Descripción'); unit=c3.text_input('Unidad','Unidad'); minimo=c4.number_input('Stock mínimo',min_value=0.0,value=0.0)
+                if st.form_submit_button('Crear'):
+                    s=db(); it=Item(sku=sku.strip(),description=desc.strip(),unit=unit.strip() or 'Unidad',minimum_stock=minimo,created_by=st.session_state['user_id']); s.add(it)
+                    try: s.commit(); audit('items',it.id,'CREATE',it.sku); st.success('Producto creado.')
                     except IntegrityError: s.rollback(); st.error('Código duplicado.')
-            s.close()
+                    finally: s.close()
+    with tabs[2]:
+        if not has_perm('items.edit'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); items=s.query(Item).order_by(Item.description).all(); s.close()
+            if items:
+                sel=st.selectbox('Producto',[f'{i.id} | {i.sku} - {i.description}' for i in items]); iid=int(sel.split(' | ')[0]); s=db(); it=s.get(Item,iid)
+                with st.form('edit_item'):
+                    c1,c2,c3,c4=st.columns(4); sku=c1.text_input('Código',it.sku); desc=c2.text_input('Descripción',it.description); unit=c3.text_input('Unidad',it.unit); minimo=c4.number_input('Stock mínimo',min_value=0.0,value=float(it.minimum_stock)); active=st.checkbox('Activo',it.active)
+                    if st.form_submit_button('Guardar'):
+                        it.sku=sku.strip(); it.description=desc.strip(); it.unit=unit.strip() or 'Unidad'; it.minimum_stock=minimo; it.active=active; it.updated_at=now(); it.updated_by=st.session_state['user_id']
+                        try: s.commit(); audit('items',iid,'UPDATE',sku); st.success('Actualizado.')
+                        except IntegrityError: s.rollback(); st.error('Código duplicado.')
+                s.close()
     with tabs[3]:
-        require_perm('items.delete'); s=db(); items=s.query(Item).order_by(Item.description).all(); sel=st.selectbox('Producto',[f'{i.id} | {i.sku} - {i.description}' for i in items],key='del_item') if items else None
-        if sel:
-            iid=int(sel.split(' | ')[0]); it=s.get(Item,iid); moves=s.query(StockMove).filter_by(item_id=iid).count(); c1,c2=st.columns(2)
-            if c1.button('Desactivar'): it.active=False; it.updated_at=now(); s.commit(); audit('items',iid,'DEACTIVATE',it.sku); st.success('Desactivado.')
-            if moves: c2.warning('No se puede eliminar porque tiene movimientos.')
-            elif c2.button('Eliminar físicamente'): s.delete(it); s.commit(); audit('items',iid,'DELETE','Eliminado'); st.success('Eliminado.')
-        s.close()
+        if not has_perm('items.delete'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); items=s.query(Item).order_by(Item.description).all(); sel=st.selectbox('Producto',[f'{i.id} | {i.sku} - {i.description}' for i in items],key='del_item') if items else None
+            if sel:
+                iid=int(sel.split(' | ')[0]); it=s.get(Item,iid); moves=s.query(StockMove).filter_by(item_id=iid).count(); c1,c2=st.columns(2)
+                if c1.button('Desactivar'): it.active=False; it.updated_at=now(); s.commit(); audit('items',iid,'DEACTIVATE',it.sku); st.success('Desactivado.')
+                if moves: c2.warning('No se puede eliminar porque tiene movimientos.')
+                elif c2.button('Eliminar físicamente'): s.delete(it); s.commit(); audit('items',iid,'DELETE','Eliminado'); st.success('Eliminado.')
+            s.close()
 elif menu=='Bodegas':
     require_perm('warehouses.view'); tabs=st.tabs(['Consultar','Crear','Editar','Desactivar / eliminar'])
     with tabs[0]:
         s=db(); rows=s.query(Warehouse).order_by(Warehouse.name).all(); s.close(); st.dataframe(pd.DataFrame([{'ID':r.id,'Bodega':r.name,'Descripción':r.description,'Activa':'Sí' if r.active else 'No'} for r in rows]),width='stretch')
     with tabs[1]:
-        require_perm('warehouses.create')
-        with st.form('new_wh',clear_on_submit=True):
-            name=st.text_input('Nombre'); desc=st.text_area('Descripción')
-            if st.form_submit_button('Crear'):
-                s=db(); w=Warehouse(name=name.strip(),description=desc.strip(),created_by=st.session_state['user_id']); s.add(w)
-                try: s.commit(); audit('warehouses',w.id,'CREATE',w.name); st.success('Bodega creada.')
-                except IntegrityError: s.rollback(); st.error('Bodega duplicada.')
-                finally: s.close()
+        if not has_perm('warehouses.create'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+
+            with st.form('new_wh',clear_on_submit=True):
+                name=st.text_input('Nombre'); desc=st.text_area('Descripción')
+                if st.form_submit_button('Crear'):
+                    s=db(); w=Warehouse(name=name.strip(),description=desc.strip(),created_by=st.session_state['user_id']); s.add(w)
+                    try: s.commit(); audit('warehouses',w.id,'CREATE',w.name); st.success('Bodega creada.')
+                    except IntegrityError: s.rollback(); st.error('Bodega duplicada.')
+                    finally: s.close()
     with tabs[2]:
-        require_perm('warehouses.edit'); s=db(); whs=s.query(Warehouse).order_by(Warehouse.name).all(); s.close()
-        if whs:
-            sel=st.selectbox('Bodega',[f'{w.id} | {w.name}' for w in whs]); wid=int(sel.split(' | ')[0]); s=db(); w=s.get(Warehouse,wid)
-            with st.form('edit_wh'):
-                name=st.text_input('Nombre',w.name); desc=st.text_area('Descripción',w.description or ''); active=st.checkbox('Activa',w.active)
-                if st.form_submit_button('Guardar'): w.name=name.strip(); w.description=desc.strip(); w.active=active; w.updated_at=now(); s.commit(); audit('warehouses',wid,'UPDATE',w.name); st.success('Actualizada.')
-            s.close()
+        if not has_perm('warehouses.edit'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); whs=s.query(Warehouse).order_by(Warehouse.name).all(); s.close()
+            if whs:
+                sel=st.selectbox('Bodega',[f'{w.id} | {w.name}' for w in whs]); wid=int(sel.split(' | ')[0]); s=db(); w=s.get(Warehouse,wid)
+                with st.form('edit_wh'):
+                    name=st.text_input('Nombre',w.name); desc=st.text_area('Descripción',w.description or ''); active=st.checkbox('Activa',w.active)
+                    if st.form_submit_button('Guardar'): w.name=name.strip(); w.description=desc.strip(); w.active=active; w.updated_at=now(); s.commit(); audit('warehouses',wid,'UPDATE',w.name); st.success('Actualizada.')
+                s.close()
     with tabs[3]:
-        require_perm('warehouses.delete'); s=db(); whs=s.query(Warehouse).order_by(Warehouse.name).all(); sel=st.selectbox('Bodega',[f'{w.id} | {w.name}' for w in whs],key='del_wh') if whs else None
-        if sel:
-            wid=int(sel.split(' | ')[0]); w=s.get(Warehouse,wid); moves=s.query(StockMove).filter_by(warehouse_id=wid).count(); c1,c2=st.columns(2)
-            if c1.button('Desactivar'): w.active=False; w.updated_at=now(); s.commit(); audit('warehouses',wid,'DEACTIVATE',w.name); st.success('Desactivada.')
-            if moves: c2.warning('No se puede eliminar porque tiene movimientos.')
-            elif c2.button('Eliminar físicamente'): s.delete(w); s.commit(); audit('warehouses',wid,'DELETE','Eliminada'); st.success('Eliminada.')
-        s.close()
+        if not has_perm('warehouses.delete'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); whs=s.query(Warehouse).order_by(Warehouse.name).all(); sel=st.selectbox('Bodega',[f'{w.id} | {w.name}' for w in whs],key='del_wh') if whs else None
+            if sel:
+                wid=int(sel.split(' | ')[0]); w=s.get(Warehouse,wid); moves=s.query(StockMove).filter_by(warehouse_id=wid).count(); c1,c2=st.columns(2)
+                if c1.button('Desactivar'): w.active=False; w.updated_at=now(); s.commit(); audit('warehouses',wid,'DEACTIVATE',w.name); st.success('Desactivada.')
+                if moves: c2.warning('No se puede eliminar porque tiene movimientos.')
+                elif c2.button('Eliminar físicamente'): s.delete(w); s.commit(); audit('warehouses',wid,'DELETE','Eliminada'); st.success('Eliminada.')
+            s.close()
 elif menu=='Bloques':
     require_perm('blocks.view'); tabs=st.tabs(['Consultar','Crear / editar','Desactivar'])
     with tabs[0]:
         s=db(); rows=s.query(Block).order_by(Block.number,Block.code).all(); s.close()
         st.dataframe(pd.DataFrame([{'ID':b.id,'Número':b.number,'Bloque':b.code,'Activo':'Sí' if b.active else 'No'} for b in rows]),width='stretch')
     with tabs[1]:
-        require_perm('blocks.manage'); s=db(); blocks=s.query(Block).order_by(Block.number,Block.code).all(); s.close(); mode=st.radio('Modo',['Crear nuevo','Editar existente'],horizontal=True)
-        if mode=='Crear nuevo':
-            with st.form('new_block'):
-                c1,c2=st.columns(2); num=c1.number_input('Número',min_value=1,value=1,step=1); code=c2.text_input('Código de bloque')
-                if st.form_submit_button('Crear bloque'):
-                    s=db(); b=Block(number=int(num),code=code.strip(),active=True); s.add(b)
-                    try: s.commit(); audit('blocks',b.id,'CREATE',b.code); st.success('Bloque creado.')
-                    except IntegrityError: s.rollback(); st.error('El código de bloque ya existe.')
-                    finally: s.close()
-        elif blocks:
-            sel=st.selectbox('Bloque',[f'{b.id} | {b.number} - {b.code}' for b in blocks]); bid=int(sel.split(' | ')[0]); s=db(); b=s.get(Block,bid)
-            with st.form('edit_block'):
-                c1,c2=st.columns(2); num=c1.number_input('Número',min_value=1,value=int(b.number),step=1); code=c2.text_input('Código',b.code); active=st.checkbox('Activo',b.active)
-                if st.form_submit_button('Guardar'):
-                    b.number=int(num); b.code=code.strip(); b.active=active; b.updated_at=now()
-                    try: s.commit(); audit('blocks',bid,'UPDATE',b.code); st.success('Bloque actualizado.')
-                    except IntegrityError: s.rollback(); st.error('Ya existe otro bloque con ese código.')
-            s.close()
+        if not has_perm('blocks.manage'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); blocks=s.query(Block).order_by(Block.number,Block.code).all(); s.close(); mode=st.radio('Modo',['Crear nuevo','Editar existente'],horizontal=True)
+            if mode=='Crear nuevo':
+                with st.form('new_block'):
+                    c1,c2=st.columns(2); num=c1.number_input('Número',min_value=1,value=1,step=1); code=c2.text_input('Código de bloque')
+                    if st.form_submit_button('Crear bloque'):
+                        s=db(); b=Block(number=int(num),code=code.strip(),active=True); s.add(b)
+                        try: s.commit(); audit('blocks',b.id,'CREATE',b.code); st.success('Bloque creado.')
+                        except IntegrityError: s.rollback(); st.error('El código de bloque ya existe.')
+                        finally: s.close()
+            elif blocks:
+                sel=st.selectbox('Bloque',[f'{b.id} | {b.number} - {b.code}' for b in blocks]); bid=int(sel.split(' | ')[0]); s=db(); b=s.get(Block,bid)
+                with st.form('edit_block'):
+                    c1,c2=st.columns(2); num=c1.number_input('Número',min_value=1,value=int(b.number),step=1); code=c2.text_input('Código',b.code); active=st.checkbox('Activo',b.active)
+                    if st.form_submit_button('Guardar'):
+                        b.number=int(num); b.code=code.strip(); b.active=active; b.updated_at=now()
+                        try: s.commit(); audit('blocks',bid,'UPDATE',b.code); st.success('Bloque actualizado.')
+                        except IntegrityError: s.rollback(); st.error('Ya existe otro bloque con ese código.')
+                s.close()
     with tabs[2]:
-        require_perm('blocks.manage'); s=db(); blocks=s.query(Block).order_by(Block.number,Block.code).all(); sel=st.selectbox('Bloque',[f'{b.id} | {b.number} - {b.code}' for b in blocks],key='del_block') if blocks else None
-        if sel:
-            bid=int(sel.split(' | ')[0]); b=s.get(Block,bid)
-            used=s.query(StockMove).filter_by(block_id=bid).count()+s.query(Asset).filter_by(block_id=bid).count()
-            c1,c2=st.columns(2)
-            if c1.button('Desactivar'): b.active=False; b.updated_at=now(); s.commit(); audit('blocks',bid,'DEACTIVATE',b.code); st.success('Bloque desactivado.')
-            if used: c2.warning('No se puede eliminar físicamente porque tiene movimientos o activos.')
-            elif c2.button('Eliminar físicamente'): s.delete(b); s.commit(); audit('blocks',bid,'DELETE','Eliminado'); st.success('Bloque eliminado.')
-        s.close()
+        if not has_perm('blocks.manage'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); blocks=s.query(Block).order_by(Block.number,Block.code).all(); sel=st.selectbox('Bloque',[f'{b.id} | {b.number} - {b.code}' for b in blocks],key='del_block') if blocks else None
+            if sel:
+                bid=int(sel.split(' | ')[0]); b=s.get(Block,bid)
+                used=s.query(StockMove).filter_by(block_id=bid).count()+s.query(Asset).filter_by(block_id=bid).count()
+                c1,c2=st.columns(2)
+                if c1.button('Desactivar'): b.active=False; b.updated_at=now(); s.commit(); audit('blocks',bid,'DEACTIVATE',b.code); st.success('Bloque desactivado.')
+                if used: c2.warning('No se puede eliminar físicamente porque tiene movimientos o activos.')
+                elif c2.button('Eliminar físicamente'): s.delete(b); s.commit(); audit('blocks',bid,'DELETE','Eliminado'); st.success('Bloque eliminado.')
+            s.close()
 elif menu=='Movimientos Kardex':
     require_perm('moves.view'); tabs=st.tabs(['Consultar','Crear','Editar','Anular','Documentos'])
     with tabs[0]:
-        s=db(); rows=s.query(StockMove,Item,Warehouse,Block,User).select_from(StockMove).join(Item,StockMove.item_id==Item.id).join(Warehouse,StockMove.warehouse_id==Warehouse.id).outerjoin(Block,StockMove.block_id==Block.id).outerjoin(User,StockMove.created_by==User.id).order_by(StockMove.id.desc()).all(); s.close(); acount=attachment_counts('stock_move'); df=pd.DataFrame([{'ID':m.id,'Fecha':m.move_date,'Código':i.sku,'Producto':i.description,'Bodega':w.name,'Bloque':block_label(b),'Tipo':m.move_type,'Cantidad':m.quantity,'Costo unit.':m.unit_cost,'Documento':m.document,'PDF adjuntos':acount.get(m.id,0),'Estado':m.status,'Reversa de':m.reversal_of,'Creado por':u.full_name if u else '','Anulado por ID':m.annulled_by,'Motivo':m.annul_reason} for m,i,w,b,u in rows]); st.dataframe(df,width='stretch'); 
+        s=db(); rows=s.query(StockMove,Item,Warehouse,Block,User).select_from(StockMove).join(Item,StockMove.item_id==Item.id).join(Warehouse,StockMove.warehouse_id==Warehouse.id).outerjoin(Block,StockMove.block_id==Block.id).outerjoin(User,StockMove.created_by==User.id).order_by(StockMove.id.desc()).all(); s.close(); acount=attachment_counts('stock_move'); df=pd.DataFrame([{'ID':m.id,'Fecha':m.move_date,'Código':i.sku,'Producto':i.description,'Bodega':w.name,'Bloque':block_label(b),'Tipo':m.move_type,'Tipo de consumo':m.consumption_type,'Detalle de consumo':m.consumption_detail,'Lote':m.consumption_lot,'Sector':m.consumption_sector,'Subsector':m.consumption_subsector,'Cantidad':m.quantity,'Costo unit.':m.unit_cost,'Documento':m.document,'PDF adjuntos':acount.get(m.id,0),'Estado':m.status,'Reversa de':m.reversal_of,'Creado por':u.full_name if u else '','Anulado por ID':m.annulled_by,'Motivo':m.annul_reason} for m,i,w,b,u in rows]); st.dataframe(df,width='stretch'); 
         if not df.empty: st.download_button('Descargar CSV',df.to_csv(index=False).encode('utf-8-sig'),'movimientos.csv','text/csv')
     with tabs[1]:
-        require_perm('moves.create'); s=db(); items=s.query(Item).filter_by(active=True).order_by(Item.description).all(); whs=s.query(Warehouse).filter_by(active=True).order_by(Warehouse.name).all(); blocks=s.query(Block).filter_by(active=True).order_by(Block.number,Block.code).all(); s.close()
-        if items and whs and blocks:
-            with st.form('new_move',clear_on_submit=True):
-                c1,c2,c3=st.columns(3); d=c1.date_input('Fecha',date.today()); item_sel=c2.selectbox('Producto',[f'{i.id} | {i.sku} - {i.description}' for i in items]); wh_sel=c3.selectbox('Bodega',[f'{w.id} | {w.name}' for w in whs])
-                c4,c5,c6=st.columns(3); block_sel=c4.selectbox('Bloque',block_options(blocks)); typ=c5.selectbox('Tipo',['Entrada','Salida','Devolución entrada','Devolución salida']); qty=c6.number_input('Cantidad',min_value=0.0001,value=1.0)
-                c7,c8=st.columns(2); cost=c7.number_input('Costo unitario',min_value=0.0,value=0.0); doc=c8.text_input('Documento')
-                adj=st.file_uploader('Adjuntar PDF de factura / soporte (opcional)',type=['pdf'],key='new_move_pdf')
-                notes=st.text_area('Observaciones')
-                if st.form_submit_button('Crear'):
-                    item_id=int(item_sel.split(' | ')[0]); wh_id=int(wh_sel.split(' | ')[0]); block_id=parse_block_id(block_sel)
-                    if block_id is None: st.error('Selecciona un bloque.'); st.stop()
-                    if typ in ('Salida','Devolución salida') and qty>current_stock(item_id,wh_id,block_id): st.error(f'Existencia insuficiente en este bloque. Disponible {current_stock(item_id,wh_id,block_id):g}'); st.stop()
-                    s=db(); m=StockMove(move_date=d,item_id=item_id,warehouse_id=wh_id,block_id=block_id,move_type=typ,quantity=qty,unit_cost=cost,document=doc.strip(),notes=notes.strip(),created_by=st.session_state['user_id']); s.add(m); s.commit(); mid=m.id; s.close(); save_attachment(adj,'stock_move',mid); audit('stock_moves',mid,'CREATE',f'{typ} {qty}'); st.success('Movimiento creado.')
-        else: st.warning('Crea primero productos, bodegas y bloques activos.')
-    with tabs[2]:
-        require_perm('moves.edit'); s=db(); rows=s.query(StockMove,Item,Warehouse).select_from(StockMove).join(Item,StockMove.item_id==Item.id).join(Warehouse,StockMove.warehouse_id==Warehouse.id).filter(StockMove.status=='Registrado', StockMove.reversal_of.is_(None)).order_by(StockMove.id.desc()).all(); items=s.query(Item).filter_by(active=True).order_by(Item.description).all(); whs=s.query(Warehouse).filter_by(active=True).order_by(Warehouse.name).all(); blocks=s.query(Block).filter_by(active=True).order_by(Block.number,Block.code).all(); s.close()
-        if rows and blocks:
-            sel=st.selectbox('Movimiento',[f'{m.id} | {m.move_date} | {i.sku} - {i.description} | {w.name} | {m.move_type} {m.quantity}' for m,i,w in rows]); mid=int(sel.split(' | ')[0]); s=db(); m=s.get(StockMove,mid)
-            item_opts=[f'{i.id} | {i.sku} - {i.description}' for i in items]; wh_opts=[f'{w.id} | {w.name}' for w in whs]; block_opts=block_options(blocks,include_empty=True); di=next((x for x in item_opts if x.startswith(f'{m.item_id} |')),item_opts[0]); dw=next((x for x in wh_opts if x.startswith(f'{m.warehouse_id} |')),wh_opts[0]); dblo=default_block_option(blocks,m.block_id,include_empty=True)
-            with st.form('edit_move'):
-                c1,c2,c3=st.columns(3); d=c1.date_input('Fecha',m.move_date); item_sel=c2.selectbox('Producto',item_opts,index=item_opts.index(di)); wh_sel=c3.selectbox('Bodega',wh_opts,index=wh_opts.index(dw)); c4,c5,c6=st.columns(3); block_sel=c4.selectbox('Bloque',block_opts,index=block_opts.index(dblo)); types=['Entrada','Salida','Devolución entrada','Devolución salida']; typ=c5.selectbox('Tipo',types,index=types.index(m.move_type)); qty=c6.number_input('Cantidad',min_value=0.0001,value=float(m.quantity)); c7,c8=st.columns(2); cost=c7.number_input('Costo unitario',min_value=0.0,value=float(m.unit_cost)); doc=c8.text_input('Documento',m.document or ''); notes=st.text_area('Observaciones',m.notes or '')
-                if st.form_submit_button('Guardar'):
-                    item_id=int(item_sel.split(' | ')[0]); wh_id=int(wh_sel.split(' | ')[0]); block_id=parse_block_id(block_sel)
-                    if block_id is None: st.error('Selecciona un bloque.'); st.stop()
-                    if typ in ('Salida','Devolución salida') and qty>current_stock(item_id,wh_id,block_id,exclude=mid): st.error(f'Existencia insuficiente sin este movimiento en este bloque: {current_stock(item_id,wh_id,block_id,exclude=mid):g}'); st.stop()
-                    m.move_date=d; m.item_id=item_id; m.warehouse_id=wh_id; m.block_id=block_id; m.move_type=typ; m.quantity=qty; m.unit_cost=cost; m.document=doc.strip(); m.notes=notes.strip(); m.updated_at=now(); m.updated_by=st.session_state['user_id']; s.commit(); audit('stock_moves',mid,'UPDATE',f'{typ} {qty}'); st.success('Actualizado.')
+        if not has_perm('moves.create'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+
+            s=db()
+            items=s.query(Item).filter_by(active=True).order_by(Item.description).all()
+            whs=s.query(Warehouse).filter_by(active=True).order_by(Warehouse.name).all()
+            blocks=s.query(Block).filter_by(active=True).order_by(Block.number,Block.code).all()
             s.close()
+            if items and whs and blocks:
+                # Se renderiza fuera del formulario: Streamlit actualiza inmediatamente
+                # los menús dependientes al elegir tipo, sector, etc.
+                types=['Entrada','Salida','Devolución entrada','Devolución salida']
+                typ=st.selectbox('Movimiento',types,key='create_move_kind')
+                classification=render_classification(st,'new_move',typ)
+                with st.form('new_move',clear_on_submit=True):
+                    c1,c2,c3=st.columns(3)
+                    d=c1.date_input('Fecha',date.today())
+                    item_sel=c2.selectbox('Producto',[f'{i.id} | {i.sku} - {i.description}' for i in items])
+                    wh_sel=c3.selectbox('Bodega',[f'{w.id} | {w.name}' for w in whs])
+                    c4,c5,c6=st.columns(3)
+                    block_sel=c4.selectbox('Bloque',block_options(blocks))
+                    qty=c5.number_input('Cantidad',min_value=0.0001,value=1.0)
+                    cost=c6.number_input('Costo unitario',min_value=0.0,value=0.0)
+                    doc=st.text_input('Documento')
+                    adj=st.file_uploader('Adjuntar PDF de factura / soporte (opcional)',type=['pdf'],key='new_move_pdf')
+                    notes=st.text_area('Observaciones')
+                    if st.form_submit_button('Crear'):
+                        item_id=int(item_sel.split(' | ')[0])
+                        wh_id=int(wh_sel.split(' | ')[0])
+                        block_id=parse_block_id(block_sel)
+                        if block_id is None:
+                            st.error('Selecciona un bloque.')
+                            st.stop()
+                        try:
+                            classification=validate_classification(typ,classification)
+                        except ValueError as exc:
+                            st.error(str(exc))
+                            st.stop()
+                        if is_outbound(typ) and qty>current_stock(item_id,wh_id,block_id):
+                            st.error(f'Existencia insuficiente en este bloque. Disponible {current_stock(item_id,wh_id,block_id):g}')
+                            st.stop()
+                        s=db()
+                        try:
+                            m=StockMove(move_date=d,item_id=item_id,warehouse_id=wh_id,
+                                block_id=block_id,move_type=typ,quantity=qty,unit_cost=cost,
+                                document=doc.strip(),notes=notes.strip(),
+                                created_by=st.session_state['user_id'],**classification)
+                            s.add(m)
+                            s.commit()
+                            mid=m.id
+                        finally:
+                            s.close()
+                        save_attachment(adj,'stock_move',mid)
+                        audit('stock_moves',mid,'CREATE',f'{typ} {qty}; {describe_classification(classification)}')
+                        st.success('Movimiento creado con su clasificación de consumo.')
+            else:
+                st.warning('Crea primero productos, bodegas y bloques activos.')
+    with tabs[2]:
+        if not has_perm('moves.edit'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+
+            s=db()
+            rows=s.query(StockMove,Item,Warehouse).select_from(StockMove).join(Item,StockMove.item_id==Item.id).join(Warehouse,StockMove.warehouse_id==Warehouse.id).filter(StockMove.status=='Registrado', StockMove.reversal_of.is_(None)).order_by(StockMove.id.desc()).all()
+            items=s.query(Item).filter_by(active=True).order_by(Item.description).all()
+            whs=s.query(Warehouse).filter_by(active=True).order_by(Warehouse.name).all()
+            blocks=s.query(Block).filter_by(active=True).order_by(Block.number,Block.code).all()
+            s.close()
+            if rows and blocks and items and whs:
+                sel=st.selectbox('Movimiento',[f'{m.id} | {m.move_date} | {i.sku} - {i.description} | {w.name} | {m.move_type} {m.quantity}' for m,i,w in rows])
+                mid=int(sel.split(' | ')[0])
+                s=db()
+                m=s.get(StockMove,mid)
+                item_opts=[f'{i.id} | {i.sku} - {i.description}' for i in items]
+                wh_opts=[f'{w.id} | {w.name}' for w in whs]
+                block_opts=block_options(blocks,include_empty=True)
+                di=next((x for x in item_opts if x.startswith(f'{m.item_id} |')),item_opts[0])
+                dw=next((x for x in wh_opts if x.startswith(f'{m.warehouse_id} |')),wh_opts[0])
+                dblo=default_block_option(blocks,m.block_id,include_empty=True)
+                types=['Entrada','Salida','Devolución entrada','Devolución salida']
+                oldvalues={field:getattr(m,field,None) for field in CAMPOS}
+                typ=st.selectbox('Movimiento',types,index=types.index(m.move_type),key=f'edit_movement_kind_{mid}')
+                classification=render_classification(st,f'edit_move_{mid}',typ,existing=oldvalues)
+                with st.form('edit_move'):
+                    c1,c2,c3=st.columns(3)
+                    d=c1.date_input('Fecha',m.move_date)
+                    item_sel=c2.selectbox('Producto',item_opts,index=item_opts.index(di))
+                    wh_sel=c3.selectbox('Bodega',wh_opts,index=wh_opts.index(dw))
+                    c4,c5,c6=st.columns(3)
+                    block_sel=c4.selectbox('Bloque',block_opts,index=block_opts.index(dblo))
+                    qty=c5.number_input('Cantidad',min_value=0.0001,value=float(m.quantity))
+                    cost=c6.number_input('Costo unitario',min_value=0.0,value=float(m.unit_cost))
+                    doc=st.text_input('Documento',m.document or '')
+                    notes=st.text_area('Observaciones',m.notes or '')
+                    if st.form_submit_button('Guardar'):
+                        item_id=int(item_sel.split(' | ')[0]); wh_id=int(wh_sel.split(' | ')[0])
+                        block_id=parse_block_id(block_sel)
+                        if block_id is None:
+                            st.error('Selecciona un bloque.'); st.stop()
+                        try:
+                            classification=validate_classification(typ,classification)
+                        except ValueError as exc:
+                            st.error(str(exc)); st.stop()
+                        # Validar el saldo del registro destino y también del origen
+                        # para impedir que modificar una entrada deje saldos negativos.
+                        old_key=(m.item_id,m.warehouse_id,m.block_id)
+                        new_key=(item_id,wh_id,block_id)
+                        old_before=current_stock(*old_key)
+                        old_effect=move_effect(m.move_type,m.quantity)
+                        new_effect=move_effect(typ,qty)
+                        if old_key==new_key:
+                            remaining=old_before-old_effect+new_effect
+                            if remaining < -1e-8:
+                                st.error('La modificación dejaría el inventario con saldo negativo.'); st.stop()
+                        else:
+                            remaining_old=old_before-old_effect
+                            remaining_new=current_stock(*new_key)+new_effect
+                            if min(remaining_old,remaining_new)<-1e-8:
+                                st.error('La modificación dejaría saldo negativo en el bloque original o en el nuevo.'); st.stop()
+                        m.move_date=d; m.item_id=item_id; m.warehouse_id=wh_id
+                        m.block_id=block_id; m.move_type=typ; m.quantity=qty
+                        m.unit_cost=cost; m.document=doc.strip(); m.notes=notes.strip()
+                        for field,value in classification.items(): setattr(m,field,value)
+                        m.updated_at=now(); m.updated_by=st.session_state['user_id']
+                        s.commit()
+                        audit('stock_moves',mid,'UPDATE',f'{typ} {qty}; {describe_classification(classification)}')
+                        st.success('Movimiento actualizado con su clasificación.')
+                s.close()
     with tabs[3]:
-        require_perm('moves.annul'); s=db(); rows=s.query(StockMove,Item,Warehouse,Block).select_from(StockMove).join(Item,StockMove.item_id==Item.id).join(Warehouse,StockMove.warehouse_id==Warehouse.id).outerjoin(Block,StockMove.block_id==Block.id).filter(StockMove.status=='Registrado', StockMove.reversal_of.is_(None)).order_by(StockMove.id.desc()).all(); s.close()
-        if rows:
-            sel=st.selectbox('Movimiento a anular',[f'{m.id} | {m.move_date} | {i.sku} - {i.description} | {w.name} | {block_label(b)} | {m.move_type} {m.quantity}' for m,i,w,b in rows]); mid=int(sel.split(' | ')[0]); reason=st.text_area('Motivo de anulación')
-            if st.button('Anular con reversa'):
-                if not reason.strip(): st.error('Indica el motivo.'); st.stop()
-                s=db(); m=s.get(StockMove,mid); revtype={'Entrada':'Salida','Salida':'Entrada','Devolución entrada':'Salida','Devolución salida':'Entrada'}[m.move_type]
-                if m.move_type in ('Entrada','Devolución entrada') and m.quantity>current_stock(m.item_id,m.warehouse_id,m.block_id): st.error('No se puede anular esta entrada porque ya fue consumida parcial o totalmente. Primero revierte las salidas relacionadas.'); st.stop()
-                m.status='Anulado'; m.annulled_by=st.session_state['user_id']; m.annulled_at=now(); m.annul_reason=reason.strip(); m.updated_at=now(); m.updated_by=st.session_state['user_id']; rev=StockMove(move_date=date.today(),item_id=m.item_id,warehouse_id=m.warehouse_id,block_id=m.block_id,move_type=revtype,quantity=m.quantity,unit_cost=m.unit_cost,document=m.document,notes=f'Reversa automática del movimiento {m.id}. Motivo: {reason.strip()}',status='Reversa',reversal_of=m.id,created_by=st.session_state['user_id']); s.add(rev); s.commit(); rid=rev.id; s.close(); audit('stock_moves',mid,'ANNUL',reason); audit('stock_moves',rid,'CREATE_REVERSAL',f'Reversa {mid}'); st.success(f'Anulado correctamente. Registro de reversa creado solo para trazabilidad: {rid}')
+        if not has_perm('moves.annul'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); rows=s.query(StockMove,Item,Warehouse,Block).select_from(StockMove).join(Item,StockMove.item_id==Item.id).join(Warehouse,StockMove.warehouse_id==Warehouse.id).outerjoin(Block,StockMove.block_id==Block.id).filter(StockMove.status=='Registrado', StockMove.reversal_of.is_(None)).order_by(StockMove.id.desc()).all(); s.close()
+            if rows:
+                sel=st.selectbox('Movimiento a anular',[f'{m.id} | {m.move_date} | {i.sku} - {i.description} | {w.name} | {block_label(b)} | {m.move_type} {m.quantity}' for m,i,w,b in rows]); mid=int(sel.split(' | ')[0]); reason=st.text_area('Motivo de anulación')
+                if st.button('Anular con reversa'):
+                    if not reason.strip(): st.error('Indica el motivo.'); st.stop()
+                    s=db(); m=s.get(StockMove,mid); revtype={'Entrada':'Salida','Salida':'Entrada','Devolución entrada':'Salida','Devolución salida':'Entrada'}[m.move_type]
+                    if m.move_type in ('Entrada','Devolución entrada') and m.quantity>current_stock(m.item_id,m.warehouse_id,m.block_id): st.error('No se puede anular esta entrada porque ya fue consumida parcial o totalmente. Primero revierte las salidas relacionadas.'); st.stop()
+                    m.status='Anulado'; m.annulled_by=st.session_state['user_id']; m.annulled_at=now(); m.annul_reason=reason.strip(); m.updated_at=now(); m.updated_by=st.session_state['user_id']; rev=StockMove(move_date=date.today(),item_id=m.item_id,warehouse_id=m.warehouse_id,block_id=m.block_id,move_type=revtype,quantity=m.quantity,unit_cost=m.unit_cost,document=m.document,notes=f'Reversa automática del movimiento {m.id}. Motivo: {reason.strip()}',status='Reversa',reversal_of=m.id,created_by=st.session_state['user_id'],**{field:getattr(m,field,None) for field in CAMPOS}); s.add(rev); s.commit(); rid=rev.id; s.close(); audit('stock_moves',mid,'ANNUL',reason); audit('stock_moves',rid,'CREATE_REVERSAL',f'Reversa {mid}'); st.success(f'Anulado correctamente. Registro de reversa creado solo para trazabilidad: {rid}')
     with tabs[4]:
         attachments_download_panel('stock_move','Documentos adjuntos de movimientos')
 elif menu=='Existencias':
@@ -541,40 +675,49 @@ elif menu=='Activos fijos':
         s=db(); rows=s.query(Asset,Block).outerjoin(Block,Asset.block_id==Block.id).order_by(Asset.id.desc()).all(); s.close(); acount=attachment_counts('asset'); df=pd.DataFrame([{'ID':a.id,'Código':a.asset_code,'Descripción':a.description,'Bloque':block_label(b),'Categoría':a.category,'Adquisición':a.acquisition_date,'Puesta en uso':a.in_service_date,'Costo':a.acquisition_cost,'Residual':a.residual_value,'Responsable':a.responsible,'Ubicación':a.location,'Proveedor':a.supplier,'Documento':a.document,'PDF adjuntos':acount.get(a.id,0),'Estado':a.status,'Activo':'Sí' if a.active else 'No'} for a,b in rows]); st.dataframe(df,width='stretch'); 
         if not df.empty: st.download_button('Descargar activos',df.to_csv(index=False).encode('utf-8-sig'),'activos_fijos.csv','text/csv')
     with tabs[1]:
-        require_perm('assets.create'); s=db(); rules=s.query(DepRule).filter_by(active=True).order_by(DepRule.category).all(); blocks=s.query(Block).filter_by(active=True).order_by(Block.number,Block.code).all(); s.close()
-        if rules and blocks:
-            with st.form('new_asset',clear_on_submit=True):
-                c1,c2,c3=st.columns(3); code=c1.text_input('Código activo'); desc=c2.text_input('Descripción'); block_sel=c3.selectbox('Bloque',block_options(blocks)); c4,c5,c6=st.columns(3); cat=c4.selectbox('Categoría',[r.category for r in rules]); acq=c5.date_input('Fecha adquisición',date.today()); serv=c6.date_input('Fecha puesta en uso',date.today()); c7,c8,c9=st.columns(3); cost=c7.number_input('Costo',min_value=0.0,value=0.0); res=c8.number_input('Valor residual',min_value=0.0,value=0.0); resp=c9.text_input('Responsable'); c10,c11,c12=st.columns(3); loc=c10.text_input('Ubicación'); supp=c11.text_input('Proveedor'); doc=c12.text_input('Documento'); adj=st.file_uploader('Adjuntar PDF de factura / soporte del activo (opcional)',type=['pdf'],key='new_asset_pdf'); notes=st.text_area('Observaciones')
-                if st.form_submit_button('Crear activo'):
-                    if res>cost or serv<acq: st.error('Revisa residual/fechas.'); st.stop()
-                    block_id=parse_block_id(block_sel)
-                    if block_id is None: st.error('Selecciona un bloque.'); st.stop()
-                    s=db(); a=Asset(asset_code=code.strip(),description=desc.strip(),block_id=block_id,category=cat,acquisition_date=acq,in_service_date=serv,acquisition_cost=cost,residual_value=res,responsible=resp.strip(),location=loc.strip(),supplier=supp.strip(),document=doc.strip(),notes=notes.strip(),created_by=st.session_state['user_id']); s.add(a)
-                    try: s.commit(); aid=a.id; save_attachment(adj,'asset',aid); audit('assets',aid,'CREATE',a.asset_code); st.success('Activo creado.')
-                    except IntegrityError: s.rollback(); st.error('Código duplicado.')
-                    finally: s.close()
+        if not has_perm('assets.create'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); rules=s.query(DepRule).filter_by(active=True).order_by(DepRule.category).all(); blocks=s.query(Block).filter_by(active=True).order_by(Block.number,Block.code).all(); s.close()
+            if rules and blocks:
+                with st.form('new_asset',clear_on_submit=True):
+                    c1,c2,c3=st.columns(3); code=c1.text_input('Código activo'); desc=c2.text_input('Descripción'); block_sel=c3.selectbox('Bloque',block_options(blocks)); c4,c5,c6=st.columns(3); cat=c4.selectbox('Categoría',[r.category for r in rules]); acq=c5.date_input('Fecha adquisición',date.today()); serv=c6.date_input('Fecha puesta en uso',date.today()); c7,c8,c9=st.columns(3); cost=c7.number_input('Costo',min_value=0.0,value=0.0); res=c8.number_input('Valor residual',min_value=0.0,value=0.0); resp=c9.text_input('Responsable'); c10,c11,c12=st.columns(3); loc=c10.text_input('Ubicación'); supp=c11.text_input('Proveedor'); doc=c12.text_input('Documento'); adj=st.file_uploader('Adjuntar PDF de factura / soporte del activo (opcional)',type=['pdf'],key='new_asset_pdf'); notes=st.text_area('Observaciones')
+                    if st.form_submit_button('Crear activo'):
+                        if res>cost or serv<acq: st.error('Revisa residual/fechas.'); st.stop()
+                        block_id=parse_block_id(block_sel)
+                        if block_id is None: st.error('Selecciona un bloque.'); st.stop()
+                        s=db(); a=Asset(asset_code=code.strip(),description=desc.strip(),block_id=block_id,category=cat,acquisition_date=acq,in_service_date=serv,acquisition_cost=cost,residual_value=res,responsible=resp.strip(),location=loc.strip(),supplier=supp.strip(),document=doc.strip(),notes=notes.strip(),created_by=st.session_state['user_id']); s.add(a)
+                        try: s.commit(); aid=a.id; save_attachment(adj,'asset',aid); audit('assets',aid,'CREATE',a.asset_code); st.success('Activo creado.')
+                        except IntegrityError: s.rollback(); st.error('Código duplicado.')
+                        finally: s.close()
     with tabs[2]:
-        require_perm('assets.edit'); s=db(); assets=s.query(Asset).order_by(Asset.id.desc()).all(); rules=s.query(DepRule).filter_by(active=True).order_by(DepRule.category).all(); blocks=s.query(Block).filter_by(active=True).order_by(Block.number,Block.code).all(); s.close()
-        if assets and rules and blocks:
-            sel=st.selectbox('Activo',[f'{a.id} | {a.asset_code} - {a.description}' for a in assets]); aid=int(sel.split(' | ')[0]); s=db(); a=s.get(Asset,aid); cats=[r.category for r in rules]; idx=cats.index(a.category) if a.category in cats else 0; block_opts=block_options(blocks,include_empty=True); dblo=default_block_option(blocks,a.block_id,include_empty=True)
-            with st.form('edit_asset'):
-                c1,c2,c3=st.columns(3); code=c1.text_input('Código',a.asset_code); desc=c2.text_input('Descripción',a.description); block_sel=c3.selectbox('Bloque',block_opts,index=block_opts.index(dblo)); c4,c5,c6=st.columns(3); cat=c4.selectbox('Categoría',cats,index=idx); acq=c5.date_input('Adquisición',a.acquisition_date); serv=c6.date_input('Puesta en uso',a.in_service_date); c7,c8,c9=st.columns(3); cost=c7.number_input('Costo',min_value=0.0,value=float(a.acquisition_cost)); res=c8.number_input('Residual',min_value=0.0,value=float(a.residual_value or 0)); resp=c9.text_input('Responsable',a.responsible or ''); c10,c11,c12=st.columns(3); loc=c10.text_input('Ubicación',a.location or ''); supp=c11.text_input('Proveedor',a.supplier or ''); doc=c12.text_input('Documento',a.document or ''); status=st.selectbox('Estado',['Activo','Baja','Vendido','Dañado','Extraviado'],index=['Activo','Baja','Vendido','Dañado','Extraviado'].index(a.status) if a.status in ['Activo','Baja','Vendido','Dañado','Extraviado'] else 0); active=st.checkbox('Activo en sistema',a.active); notes=st.text_area('Observaciones',a.notes or '')
-                if st.form_submit_button('Guardar'):
-                    if res>cost or serv<acq: st.error('Revisa residual/fechas.'); st.stop()
-                    block_id=parse_block_id(block_sel)
-                    if block_id is None: st.error('Selecciona un bloque.'); st.stop()
-                    a.asset_code=code.strip(); a.description=desc.strip(); a.block_id=block_id; a.category=cat; a.acquisition_date=acq; a.in_service_date=serv; a.acquisition_cost=cost; a.residual_value=res; a.responsible=resp.strip(); a.location=loc.strip(); a.supplier=supp.strip(); a.document=doc.strip(); a.status=status; a.active=active; a.notes=notes.strip(); a.updated_at=now(); a.updated_by=st.session_state['user_id']
-                    try: s.commit(); audit('assets',aid,'UPDATE',a.asset_code); st.success('Activo actualizado.')
-                    except IntegrityError: s.rollback(); st.error('Código duplicado.')
-            s.close()
+        if not has_perm('assets.edit'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); assets=s.query(Asset).order_by(Asset.id.desc()).all(); rules=s.query(DepRule).filter_by(active=True).order_by(DepRule.category).all(); blocks=s.query(Block).filter_by(active=True).order_by(Block.number,Block.code).all(); s.close()
+            if assets and rules and blocks:
+                sel=st.selectbox('Activo',[f'{a.id} | {a.asset_code} - {a.description}' for a in assets]); aid=int(sel.split(' | ')[0]); s=db(); a=s.get(Asset,aid); cats=[r.category for r in rules]; idx=cats.index(a.category) if a.category in cats else 0; block_opts=block_options(blocks,include_empty=True); dblo=default_block_option(blocks,a.block_id,include_empty=True)
+                with st.form('edit_asset'):
+                    c1,c2,c3=st.columns(3); code=c1.text_input('Código',a.asset_code); desc=c2.text_input('Descripción',a.description); block_sel=c3.selectbox('Bloque',block_opts,index=block_opts.index(dblo)); c4,c5,c6=st.columns(3); cat=c4.selectbox('Categoría',cats,index=idx); acq=c5.date_input('Adquisición',a.acquisition_date); serv=c6.date_input('Puesta en uso',a.in_service_date); c7,c8,c9=st.columns(3); cost=c7.number_input('Costo',min_value=0.0,value=float(a.acquisition_cost)); res=c8.number_input('Residual',min_value=0.0,value=float(a.residual_value or 0)); resp=c9.text_input('Responsable',a.responsible or ''); c10,c11,c12=st.columns(3); loc=c10.text_input('Ubicación',a.location or ''); supp=c11.text_input('Proveedor',a.supplier or ''); doc=c12.text_input('Documento',a.document or ''); status=st.selectbox('Estado',['Activo','Baja','Vendido','Dañado','Extraviado'],index=['Activo','Baja','Vendido','Dañado','Extraviado'].index(a.status) if a.status in ['Activo','Baja','Vendido','Dañado','Extraviado'] else 0); active=st.checkbox('Activo en sistema',a.active); notes=st.text_area('Observaciones',a.notes or '')
+                    if st.form_submit_button('Guardar'):
+                        if res>cost or serv<acq: st.error('Revisa residual/fechas.'); st.stop()
+                        block_id=parse_block_id(block_sel)
+                        if block_id is None: st.error('Selecciona un bloque.'); st.stop()
+                        a.asset_code=code.strip(); a.description=desc.strip(); a.block_id=block_id; a.category=cat; a.acquisition_date=acq; a.in_service_date=serv; a.acquisition_cost=cost; a.residual_value=res; a.responsible=resp.strip(); a.location=loc.strip(); a.supplier=supp.strip(); a.document=doc.strip(); a.status=status; a.active=active; a.notes=notes.strip(); a.updated_at=now(); a.updated_by=st.session_state['user_id']
+                        try: s.commit(); audit('assets',aid,'UPDATE',a.asset_code); st.success('Activo actualizado.')
+                        except IntegrityError: s.rollback(); st.error('Código duplicado.')
+                s.close()
     with tabs[3]:
-        require_perm('assets.delete'); s=db(); assets=s.query(Asset).order_by(Asset.id.desc()).all(); sel=st.selectbox('Activo',[f'{a.id} | {a.asset_code} - {a.description} | {a.status}' for a in assets],key='asset_del') if assets else None
-        if sel:
-            aid=int(sel.split(' | ')[0]); a=s.get(Asset,aid); c1,c2,c3=st.columns(3)
-            if c1.button('Dar de baja'): a.status='Baja'; a.active=False; a.updated_at=now(); s.commit(); audit('assets',aid,'DEACTIVATE',a.asset_code); st.success('Dado de baja.')
-            if c2.button('Reactivar'): a.status='Activo'; a.active=True; a.updated_at=now(); s.commit(); audit('assets',aid,'REACTIVATE',a.asset_code); st.success('Reactivado.')
-            if c3.button('Eliminar físicamente'): s.delete(a); s.commit(); audit('assets',aid,'DELETE','Eliminado'); st.success('Eliminado.')
-        s.close()
+        if not has_perm('assets.delete'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); assets=s.query(Asset).order_by(Asset.id.desc()).all(); sel=st.selectbox('Activo',[f'{a.id} | {a.asset_code} - {a.description} | {a.status}' for a in assets],key='asset_del') if assets else None
+            if sel:
+                aid=int(sel.split(' | ')[0]); a=s.get(Asset,aid); c1,c2,c3=st.columns(3)
+                if c1.button('Dar de baja'): a.status='Baja'; a.active=False; a.updated_at=now(); s.commit(); audit('assets',aid,'DEACTIVATE',a.asset_code); st.success('Dado de baja.')
+                if c2.button('Reactivar'): a.status='Activo'; a.active=True; a.updated_at=now(); s.commit(); audit('assets',aid,'REACTIVATE',a.asset_code); st.success('Reactivado.')
+                if c3.button('Eliminar físicamente'): s.delete(a); s.commit(); audit('assets',aid,'DELETE','Eliminado'); st.success('Eliminado.')
+            s.close()
     with tabs[4]:
         attachments_download_panel('asset','Documentos adjuntos de activos fijos')
 elif menu=='Depreciación':
@@ -613,29 +756,35 @@ elif menu=='Reglas depreciación':
     with tabs[0]:
         s=db(); rows=s.query(DepRule).order_by(DepRule.category).all(); s.close(); st.dataframe(pd.DataFrame([{'ID':r.id,'Categoría':r.category,'Tasa anual %':r.annual_rate*100,'Vida útil años':r.useful_life_years,'Activa':'Sí' if r.active else 'No'} for r in rows]),width='stretch')
     with tabs[1]:
-        require_perm('deprules.manage'); s=db(); rules=s.query(DepRule).order_by(DepRule.category).all(); s.close(); mode=st.radio('Modo',['Crear nueva','Editar existente'],horizontal=True)
-        if mode=='Crear nueva':
-            with st.form('new_rule'):
-                c1,c2,c3=st.columns(3); cat=c1.text_input('Categoría'); rate=c2.number_input('Tasa anual %',min_value=0.01,max_value=100.0,value=20.0); life=c3.number_input('Vida útil años',min_value=0.1,value=5.0)
-                if st.form_submit_button('Crear'):
-                    s=db(); r=DepRule(category=cat.strip(),annual_rate=rate/100,useful_life_years=life,created_by=st.session_state['user_id']); s.add(r)
-                    try: s.commit(); audit('depreciation_rules',r.id,'CREATE',r.category); st.success('Regla creada.')
-                    except IntegrityError: s.rollback(); st.error('Categoría duplicada.')
-                    finally: s.close()
-        elif rules:
-            sel=st.selectbox('Regla',[f'{r.id} | {r.category}' for r in rules]); rid=int(sel.split(' | ')[0]); s=db(); r=s.get(DepRule,rid)
-            with st.form('edit_rule'):
-                c1,c2,c3=st.columns(3); cat=c1.text_input('Categoría',r.category); rate=c2.number_input('Tasa anual %',min_value=0.01,max_value=100.0,value=float(r.annual_rate*100)); life=c3.number_input('Vida útil años',min_value=0.1,value=float(r.useful_life_years)); active=st.checkbox('Activa',r.active)
-                if st.form_submit_button('Guardar'): r.category=cat.strip(); r.annual_rate=rate/100; r.useful_life_years=life; r.active=active; r.updated_at=now(); s.commit(); audit('depreciation_rules',rid,'UPDATE',r.category); st.success('Regla actualizada.')
-            s.close()
+        if not has_perm('deprules.manage'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); rules=s.query(DepRule).order_by(DepRule.category).all(); s.close(); mode=st.radio('Modo',['Crear nueva','Editar existente'],horizontal=True)
+            if mode=='Crear nueva':
+                with st.form('new_rule'):
+                    c1,c2,c3=st.columns(3); cat=c1.text_input('Categoría'); rate=c2.number_input('Tasa anual %',min_value=0.01,max_value=100.0,value=20.0); life=c3.number_input('Vida útil años',min_value=0.1,value=5.0)
+                    if st.form_submit_button('Crear'):
+                        s=db(); r=DepRule(category=cat.strip(),annual_rate=rate/100,useful_life_years=life,created_by=st.session_state['user_id']); s.add(r)
+                        try: s.commit(); audit('depreciation_rules',r.id,'CREATE',r.category); st.success('Regla creada.')
+                        except IntegrityError: s.rollback(); st.error('Categoría duplicada.')
+                        finally: s.close()
+            elif rules:
+                sel=st.selectbox('Regla',[f'{r.id} | {r.category}' for r in rules]); rid=int(sel.split(' | ')[0]); s=db(); r=s.get(DepRule,rid)
+                with st.form('edit_rule'):
+                    c1,c2,c3=st.columns(3); cat=c1.text_input('Categoría',r.category); rate=c2.number_input('Tasa anual %',min_value=0.01,max_value=100.0,value=float(r.annual_rate*100)); life=c3.number_input('Vida útil años',min_value=0.1,value=float(r.useful_life_years)); active=st.checkbox('Activa',r.active)
+                    if st.form_submit_button('Guardar'): r.category=cat.strip(); r.annual_rate=rate/100; r.useful_life_years=life; r.active=active; r.updated_at=now(); s.commit(); audit('depreciation_rules',rid,'UPDATE',r.category); st.success('Regla actualizada.')
+                s.close()
     with tabs[2]:
-        require_perm('deprules.manage'); s=db(); rules=s.query(DepRule).order_by(DepRule.category).all(); sel=st.selectbox('Regla',[f'{r.id} | {r.category}' for r in rules],key='del_rule') if rules else None
-        if sel:
-            rid=int(sel.split(' | ')[0]); r=s.get(DepRule,rid); used=s.query(Asset).filter_by(category=r.category).count(); c1,c2=st.columns(2)
-            if c1.button('Desactivar'): r.active=False; r.updated_at=now(); s.commit(); audit('depreciation_rules',rid,'DEACTIVATE',r.category); st.success('Desactivada.')
-            if used: c2.warning('No puede eliminarse porque hay activos en esa categoría.')
-            elif c2.button('Eliminar físicamente'): s.delete(r); s.commit(); audit('depreciation_rules',rid,'DELETE','Eliminada'); st.success('Eliminada.')
-        s.close()
+        if not has_perm('deprules.manage'):
+            st.info('Tu rol no tiene permiso para realizar esta operación.')
+        else:
+            s=db(); rules=s.query(DepRule).order_by(DepRule.category).all(); sel=st.selectbox('Regla',[f'{r.id} | {r.category}' for r in rules],key='del_rule') if rules else None
+            if sel:
+                rid=int(sel.split(' | ')[0]); r=s.get(DepRule,rid); used=s.query(Asset).filter_by(category=r.category).count(); c1,c2=st.columns(2)
+                if c1.button('Desactivar'): r.active=False; r.updated_at=now(); s.commit(); audit('depreciation_rules',rid,'DEACTIVATE',r.category); st.success('Desactivada.')
+                if used: c2.warning('No puede eliminarse porque hay activos en esa categoría.')
+                elif c2.button('Eliminar físicamente'): s.delete(r); s.commit(); audit('depreciation_rules',rid,'DELETE','Eliminada'); st.success('Eliminada.')
+            s.close()
 elif menu=='Usuarios y roles':
     require_perm('users.manage'); tabs=st.tabs(['Usuarios','Crear usuario','Editar usuario','Roles y permisos'])
     with tabs[0]:
