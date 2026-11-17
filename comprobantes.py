@@ -16,7 +16,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Table, TableStyle, Spacer, Image,
-    KeepTogether, HRFlowable
+    KeepTogether, KeepInFrame, HRFlowable
 )
 
 BLUE = colors.HexColor('#165A77')
@@ -154,8 +154,14 @@ def generar_comprobante(data, logo_path=None):
     ]],colWidths=cw,rowHeights=[26])
     th.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),BLUE),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),6)]))
     story.append(th)
-    row=Table([[p(data.get('sku')),p(data.get('producto')),p(data.get('unidad')),
-                p(_number(data.get('cantidad'))),p(f"${float(data.get('costo') or 0):,.2f}")]], colWidths=cw,rowHeights=[46])
+    item_cells=[p(data.get('sku')),p(data.get('producto')),p(data.get('unidad')),
+                p(_number(data.get('cantidad'))),p(f"${float(data.get('costo') or 0):,.2f}")]
+    # En salidas, la descripcion puede ocupar varias lineas: asignar espacio
+    # antes de compactar la hoja para evitar texto sobre otras secciones.
+    item_height=46
+    if kind == 'Salida':
+        item_height=max(46, max(c.wrap(w-12, 9999)[1] for c,w in zip(item_cells,cw))+14)
+    row=Table([item_cells], colWidths=cw,rowHeights=[item_height])
     row.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.5,BORDER),('INNERGRID',(0,0),(-1,-1),.3,BORDER),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('BACKGROUND',(0,0),(-1,-1),LIGHT),('LEFTPADDING',(0,0),(-1,-1),6)]))
     story.append(row); story.append(Spacer(1,9))
 
@@ -170,7 +176,11 @@ def generar_comprobante(data, logo_path=None):
         story.append(block); story.append(Spacer(1,8))
 
     story.append(section('OBSERVACIONES'))
-    notes=Table([[p(data.get('observaciones') or 'Sin observaciones')]],colWidths=[W],rowHeights=[51])
+    note_cell=p(data.get('observaciones') or 'Sin observaciones')
+    notes_height=51
+    if kind == 'Salida':
+        notes_height=max(51, note_cell.wrap(W-16, 9999)[1]+14)
+    notes=Table([[note_cell]],colWidths=[W],rowHeights=[notes_height])
     notes.setStyle(TableStyle([('BOX',(0,0),(-1,-1),.5,BORDER),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),8),('TOPPADDING',(0,0),(-1,-1),7)]))
     story.append(notes); story.append(Spacer(1,11))
 
@@ -215,5 +225,15 @@ def generar_comprobante(data, logo_path=None):
         canvas.drawString(16*mm,8*mm,'BAV TOROGOZ  |  Control de inventario / activo fijo')
         canvas.drawRightString(letter[0]-16*mm,8*mm,f'{folio}  ·  Página {doc.page}')
         canvas.restoreState()
+    # Unicamente el tipo Salida (vigente o anulado) se ajusta a una hoja carta.
+    # KeepInFrame reduce proporcionalmente el contenido cuando el texto largo
+    # hace que la constancia de firmas y la nota salten a una segunda pagina.
+    # El resto de los comprobantes conserva su comportamiento original.
+    if kind == 'Salida':
+        for element in story:
+            if isinstance(element, Table):
+                element.hAlign = 'LEFT'
+        story = [KeepInFrame(W, doc.height - 4*mm, story,
+                             mode='shrink', hAlign='LEFT', vAlign='TOP')]
     doc.build(story,onFirstPage=on_page,onLaterPages=on_page)
     return buffer.getvalue()
