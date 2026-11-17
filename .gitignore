@@ -2,5 +2,10 @@ __pycache__/
 *.pyc
 .venv/
 .env
+.idea/
 backups/
-*.db-journal
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+.streamlit/secrets.toml
